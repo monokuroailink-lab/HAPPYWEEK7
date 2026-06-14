@@ -1,0 +1,31 @@
+{
+  "name": "happyweek7",
+  "version": "0.2.0",
+  "description": "HAPPYWEEK7: deterministic Claude Code hook guard for raw tool-call leaks.",
+  "bin": {
+    "week7": "./bin/week7.js"
+  },
+  "scripts": {
+    "test": "node ./bin/week7.js test",
+    "status": "node ./bin/week7.js status",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "files": [
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "claude-code",
+    "hooks",
+    "tool-call",
+    "guard"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
