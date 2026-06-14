@@ -122,10 +122,29 @@ function install(options) {
 }
 
 function uninstall(options) {
-  const settings = readSettings();
-  backupSettings("uninstall");
+  const settings = readSettings(false);
+  if (!settings) {
+    if (options.purge) {
+      rmIfExists(configPath);
+      rmIfExists(statePath);
+      rmIfExists(logPath);
+      console.log(`${APP_NAME} is not installed.`);
+      console.log("Purged config, state, and log files.");
+      return;
+    }
+
+    console.log(`${APP_NAME} is not installed.`);
+    return;
+  }
+
   ensureHooks(settings);
   const removed = removeWeek7Hooks(settings);
+  if (removed === 0 && !options.purge) {
+    console.log(`${APP_NAME} is not installed.`);
+    return;
+  }
+
+  backupSettings("uninstall");
   writeSettings(settings);
   logLine(`uninstalled removedHooks=${removed}`);
 
@@ -244,6 +263,7 @@ function runHook() {
 }
 
 function runTests() {
+  useMemoryState();
   const sessionId = `test-${Date.now()}`;
   const bad = [
     "notifyDiscord structure is ready.",
@@ -440,7 +460,19 @@ function readConfig() {
   }
 }
 
+// When set, state lives only in memory and never touches disk. The test suite
+// turns this on so running `week7 test` cannot pollute a real user's
+// ~/.claude/week7/state.json (rewrite-once history).
+let memoryState = null;
+
+function useMemoryState() {
+  memoryState = { blocked: {} };
+}
+
 function readState() {
+  if (memoryState) {
+    return memoryState;
+  }
   if (!fs.existsSync(statePath)) {
     return { blocked: {} };
   }
@@ -456,12 +488,16 @@ function readState() {
 }
 
 function writeState(state) {
-  ensureDir(appDir);
   const keys = Object.keys(state.blocked || {}).slice(-300);
   const trimmed = {};
   keys.forEach((key) => {
     trimmed[key] = state.blocked[key];
   });
+  if (memoryState) {
+    memoryState.blocked = trimmed;
+    return;
+  }
+  ensureDir(appDir);
   writeJson(statePath, { blocked: trimmed });
 }
 
