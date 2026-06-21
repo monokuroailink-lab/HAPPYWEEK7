@@ -10,6 +10,11 @@ const APP_NAME = "HAPPYWEEK7";
 const CLI_NAME = "week7";
 const DEFAULT_MODE = "rewrite-once";
 const VALID_MODES = new Set(["warn", "rewrite-once", "strict"]);
+// Loop breaker: after this many blocks in one session we stop blocking and let
+// the turn end. The "call"/"court" tool-call serialization bug (claude-code
+// issue #68354) is model-side and cannot be fixed by a rewrite, so blocking it
+// repeatedly just burns turns. Counts per session, independent of leak hash.
+const MAX_SESSION_BLOCKS = 3;
 // A real harness leak is a raw, unnamespaced opening tag that carries a name="..."
 // attribute. Requiring the attribute (B) keeps the word "invoke" in prose from firing,
 // and code regions are masked first (A) so documentation examples never count.
@@ -226,6 +231,9 @@ function runHook() {
     const message = String(payload.last_assistant_message || "");
     const leak = detectLeak(message);
     if (!leak) {
+      // A clean turn ends the current leak burst, so reset this session's
+      // block counter. The cap then applies per burst, not per whole session.
+      resetSessionBlocks(String(payload.session_id || "unknown-session"));
       return;
     }
 
@@ -249,10 +257,17 @@ function runHook() {
       return;
     }
 
+    const sessionBlocks = state.sessionBlocks[sessionId] || 0;
+    if (sessionBlocks >= MAX_SESSION_BLOCKS) {
+      logLine(`loop-cap event=${eventName} session=${safeForLog(sessionId)} blocks=${sessionBlocks} cap=${MAX_SESSION_BLOCKS}`);
+      return;
+    }
+
     state.blocked[stateKey] = {
       at: new Date().toISOString(),
       preview
     };
+    state.sessionBlocks[sessionId] = sessionBlocks + 1;
     writeState(state);
 
     writeHookJson({
@@ -342,6 +357,39 @@ function runTests() {
     console.log("PASS block reason has no angle brackets");
   }
 
+  // Loop breaker: distinct-hash leaks in one session (the court bug pattern)
+  // should block MAX_SESSION_BLOCKS times, then be allowed through.
+  const loopSession = `loop-${Date.now()}`;
+  const loopBlocked = [0, 1, 2, 3, 4].map((n) => {
+    const msg = `attempt ${n} ${LT}invoke name="Bash">${LT}parameter name="command">echo ${n}${LT}/parameter>`;
+    const out = simulateHook("Stop", loopSession, msg);
+    return Boolean(out) && JSON.parse(out).decision === "block";
+  });
+  const expectedLoop = [true, true, true, false, false];
+  const loopOk = loopBlocked.every((v, i) => v === expectedLoop[i]);
+  if (!loopOk) {
+    failed += 1;
+    console.log(`FAIL loop breaker caps at ${MAX_SESSION_BLOCKS} (got ${JSON.stringify(loopBlocked)})`);
+  } else {
+    console.log(`PASS loop breaker caps at ${MAX_SESSION_BLOCKS} blocks per session`);
+  }
+
+  // A clean (no-leak) turn resets the counter, so the cap is per burst: after a
+  // capped burst, a clean turn re-arms the guard for the next burst.
+  const resetSession = `reset-${Date.now()}`;
+  const mkLeak = (n) => `attempt ${n} ${LT}invoke name="Bash">${LT}parameter name="command">echo ${n}${LT}/parameter>`;
+  [0, 1, 2].forEach((n) => simulateHook("Stop", resetSession, mkLeak(n)));
+  const cappedOut = simulateHook("Stop", resetSession, mkLeak(3));
+  simulateHook("Stop", resetSession, "clean turn with no tool markup at all");
+  const afterResetOut = simulateHook("Stop", resetSession, mkLeak(4));
+  const resetOk = cappedOut === "" && Boolean(afterResetOut) && JSON.parse(afterResetOut).decision === "block";
+  if (!resetOk) {
+    failed += 1;
+    console.log("FAIL clean turn resets the loop counter");
+  } else {
+    console.log("PASS clean turn resets the loop counter (per-burst cap)");
+  }
+
   if (failed > 0) {
     process.exitCode = 1;
     return;
@@ -369,6 +417,7 @@ function runHookWithPayload(payload, modeOverride) {
   const message = String(payload.last_assistant_message || "");
   const leak = detectLeak(message);
   if (!leak) {
+    resetSessionBlocks(String(payload.session_id || "unknown-session"));
     return "";
   }
 
@@ -386,10 +435,16 @@ function runHookWithPayload(payload, modeOverride) {
     return "";
   }
 
+  const sessionBlocks = state.sessionBlocks[sessionId] || 0;
+  if (sessionBlocks >= MAX_SESSION_BLOCKS) {
+    return "";
+  }
+
   state.blocked[stateKey] = {
     at: new Date().toISOString(),
     preview: makePreview(message, leak.index)
   };
+  state.sessionBlocks[sessionId] = sessionBlocks + 1;
   writeState(state);
 
   return JSON.stringify({
@@ -411,11 +466,12 @@ function blockReason(mode, hash) {
   return [
     "週七出勤喜んで！",
     "",
-    "HAPPYWEEK7 blocked a raw tool-call leak.",
-    "Rewrite the response without exposing internal tool-call markup.",
-    `Mode: ${mode}.`,
+    "HAPPYWEEK7 detected a raw tool-call leak (Claude Code issue #68354).",
+    "The tool call was printed as text instead of running, so it did not execute.",
+    "This is a model-side serialization bug; rewriting the same turn will not fix it.",
+    "新しい会話で再開を推奨します。残業代はいりません！",
     "This is a deterministic local hook, not an AI check.",
-    `Leak hash: ${hash}`
+    `Mode: ${mode}. Leak hash: ${hash}`
   ].join("\n");
 }
 
@@ -466,7 +522,7 @@ function readConfig() {
 let memoryState = null;
 
 function useMemoryState() {
-  memoryState = { blocked: {} };
+  memoryState = { blocked: {}, sessionBlocks: {} };
 }
 
 function readState() {
@@ -474,16 +530,28 @@ function readState() {
     return memoryState;
   }
   if (!fs.existsSync(statePath)) {
-    return { blocked: {} };
+    return { blocked: {}, sessionBlocks: {} };
   }
   try {
     const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
     if (!state.blocked || typeof state.blocked !== "object") {
       state.blocked = {};
     }
+    if (!state.sessionBlocks || typeof state.sessionBlocks !== "object") {
+      state.sessionBlocks = {};
+    }
     return state;
   } catch {
-    return { blocked: {} };
+    return { blocked: {}, sessionBlocks: {} };
+  }
+}
+
+function resetSessionBlocks(sessionId) {
+  const state = readState();
+  if (state.sessionBlocks[sessionId]) {
+    delete state.sessionBlocks[sessionId];
+    writeState(state);
+    logLine(`loop-reset session=${safeForLog(sessionId)}`);
   }
 }
 
@@ -493,12 +561,18 @@ function writeState(state) {
   keys.forEach((key) => {
     trimmed[key] = state.blocked[key];
   });
+  const sessionKeys = Object.keys(state.sessionBlocks || {}).slice(-300);
+  const trimmedSessions = {};
+  sessionKeys.forEach((key) => {
+    trimmedSessions[key] = state.sessionBlocks[key];
+  });
   if (memoryState) {
     memoryState.blocked = trimmed;
+    memoryState.sessionBlocks = trimmedSessions;
     return;
   }
   ensureDir(appDir);
-  writeJson(statePath, { blocked: trimmed });
+  writeJson(statePath, { blocked: trimmed, sessionBlocks: trimmedSessions });
 }
 
 function readSettings(required = true) {

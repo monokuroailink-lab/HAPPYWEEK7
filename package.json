@@ -1,6 +1,6 @@
 {
   "name": "happyweek7",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "HAPPYWEEK7: deterministic Claude Code hook guard for raw tool-call leaks.",
   "homepage": "https://github.com/monokuroailink-lab/HAPPYWEEK7#readme",
   "repository": {
